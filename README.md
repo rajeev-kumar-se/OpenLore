@@ -261,17 +261,17 @@ Everyone in this category answers the same first question: **how does the agent 
 
 OpenLore answers it too — then keeps going into the **second question almost nobody is answering: what happens when the agent starts writing?** A retrieval layer makes an agent *informed*; it doesn't make it *safe*. Nothing in a symbol index tells you this diff opened a path into your auth boundary, this signature change breaks four consumers by name, or the fact your agent has used for 40 tool calls went stale 12 commits ago. That half — **governance, on the same graph, no LLM in the loop** — is what OpenLore was built for.
 
-| | Agent built-ins<br>*(Cursor, Claude Code)* | LSP toolkits<br>*(e.g. Serena)* | Graph MCP servers | Search platforms<br>*(e.g. Sourcegraph)* | **OpenLore** |
-|---|---|---|---|---|---|
-| Structural context instead of file reads | ❌ grep + reads | ✓ symbols | ✓ parsed graph | ✓ index | ✓ call graph + **IaC + decisions on one graph** |
-| Local, no API key, deterministic | Partial | ✓ | ✓ | ❌ hosted | ✓ no LLM in the hot path |
-| Cross-session memory anchored to code | ❌ | Partial | ✓ notes | ❌ | ✓ **carried across renames**, self-invalidating |
-| Told when a cached fact goes **stale** | ❌ | ❌ | ❌ | ❌ | ✓ Epistemic Lease |
-| Blast radius + which tests to run | ❌ | ❌ | Partial | Partial | ✓ backward reachability, with paths |
-| Breaking-change **verdict** over a diff | ❌ | ❌ | Partial | ❌ | ✓ per export, **consumers named** |
-| "Did this diff open a path into a sensitive boundary?" | ❌ | ❌ | ❌ | ❌ | ✓ differential, pre-commit |
-| Spec/code drift + ADRs gated at commit | ❌ | ❌ | ❌ | ❌ | ✓ milliseconds, no API key |
-| Cost/round-trip effect **published with the losses** | ❌ | ❌ | ❌ | ❌ | ✓ −26% round-trips on deep tasks |
+| | Agent built-ins<br>*(Cursor, Claude Code)* | Sourcegraph + MCP | Serena | codebase-memory-mcp | GitNexus | Probe<br>*(Rust, ProbeLabs)* | Sverklo | Sentra | **OpenLore** |
+|---|---|---|---|---|---|---|---|---|---|
+| Structural context instead of file reads | ❌ grep + reads | ✓ index | ✓ symbols | ✓ parsed graph | ✓ execution flow + routes | ✓ focused retrieval | ✓ caller/impact | Partial decisions/docs | ✓ call graph + **IaC + decisions on one graph** |
+| Local, no API key, deterministic | Partial | ❌ hosted | ✓ | ✓ | ✓ browser-local | ✓ | ✓ | ❌ | ✓ no LLM in the hot path |
+| Cross-session memory anchored to code | ❌ | ❌ | Partial | ✓ notes | ❌ | ❌ | ✓ Git-aware decisions | Partial | ✓ **carried across renames**, self-invalidating |
+| Told when a cached fact goes **stale** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✓ Epistemic Lease |
+| Blast radius + which tests to run | ❌ | Partial | ❌ | Partial | Partial | ❌ | Partial | ❌ | ✓ backward reachability, with paths |
+| Breaking-change **verdict** over a diff | ❌ | ❌ | ❌ | Partial | ❌ | ❌ | ❌ | ❌ | ✓ per export, **consumers named** |
+| "Did this diff open a path into a sensitive boundary?" | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✓ differential, pre-commit |
+| Spec/code drift + ADRs gated at commit | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✓ milliseconds, no API key |
+| Cost/round-trip effect **published with the losses** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✓ −26% round-trips on deep tasks |
 
 **Where the others are the better pick** — we'd rather you use the right tool than ours:
 
@@ -281,6 +281,19 @@ OpenLore answers it too — then keeps going into the **second question almost n
 - **A small, familiar repo and shallow questions** — your agent's built-in search is often cheaper. We measured it and [published it](#value-scorecard--does-it-pay-for-itself).
 
 *Comparisons reflect each project's publicly documented capabilities as of July 2026 and describe categories, not verdicts on quality; a correction PR is always welcome. OpenLore [exports SCIP](docs/scip-export.md), so it sits alongside these tools rather than against them.*
+
+### Tool-by-tool notes
+
+| Tool | Fit for your commerce → supply-chain problem |
+|---|---|
+| Sourcegraph + MCP | My first choice for an organization-wide deployment. Centralized search plus SCIP-based definitions/references across indexed code. Require a pilot on your actual monorepo and Java build configuration. |
+| Serena | Useful companion for Java navigation and edits. Uses language servers or JetBrains analysis to retrieve symbols, references, and implementations rather than whole files. Its reach depends on the projects/dependencies loaded by that backend. |
+| codebase-memory-mcp | My first local graph pilot. Persistent call/dependency graph, path tracing, snippets, incremental updates, and coverage checks. Its published Linux-kernel example is about 75,000 files—not millions; do not extrapolate the advertised savings to your repo. |
+| OpenLore | Helps with repeated orientation and fix quality: task briefings, impact analysis, test prioritization, and breaking-change checks. Initial analysis is still a full build; package-level refresh comes afterward. Better evaluated on a bounded area first. |
+| GitNexus | Relevant execution-flow, route-map, and impact tools. Check its current PolyForm Noncommercial license before company use. Browser-only indexing is unsuitable for your scale. |
+| Probe—Rust, by ProbeLabs | Useful for focused code retrieval, token budgets, and avoiding repeated context. Not, by itself, proof of every end-to-end invocation path. |
+| Sverklo | Relevant caller/impact tools and Git-aware decision memory, but its published performance examples reach roughly 4,000 files—not evidence for a million-file deployment. |
+| Sentra | More relevant when missing context is team decisions, ownership, Slack, or documents. I would not select it as the primary Java call-resolution engine based on its own comparison article. |
 
 ---
 
