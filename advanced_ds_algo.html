@@ -40,6 +40,8 @@
   th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
   th{background:#10161d;color:#cfe3ff;font-weight:600}
   tr:nth-child(even) td{background:#121821}
+  .tablewrap{overflow-x:auto;margin:14px 0;-webkit-overflow-scrolling:touch}
+  .tablewrap table{margin:0;min-width:960px;font-size:13.5px}
   .mermaid{background:#0b0f14;border:1px solid var(--line);border-radius:12px;padding:14px;margin:16px 0;
        text-align:center;overflow:auto}
   .note{border-left:3px solid var(--accent);background:#0f1620;padding:10px 14px;border-radius:0 8px 8px 0;color:#cdd9e5}
@@ -114,9 +116,10 @@
     <a href="#s7">7 · Small but sharp structures</a>
     <a href="#s8">8 · Persistence engines</a>
     <a href="#s9">9 · End-to-end: one function through every structure</a>
-    <a href="#s10">10 · Complexity &amp; memory table</a>
-    <a href="#s11">11 · Deliberately NOT used</a>
-    <a href="#s12">12 · Future: how to integrate new structures</a>
+    <a href="#s10">10 · How the artifacts are generated</a>
+    <a href="#s11">11 · Complexity &amp; memory table</a>
+    <a href="#s12">12 · Deliberately NOT used</a>
+    <a href="#s13">13 · Future: how to integrate new structures</a>
   </nav>
 </div>
 
@@ -1033,26 +1036,360 @@ flowchart TD
 <hr>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
-<h2 id="s10">10 · Complexity &amp; memory table</h2>
+<h2 id="s10">10 · How the artifacts are generated</h2>
+<p>
+  The earlier sections explain each structure on its own. This one is the <b>run-the-app flow</b>.
+  Take two Java classes that live in <b>different modules</b>, where one calls the other, and follow a
+  single <code>openlore analyze</code> from bytes on disk to the published artifact set — showing
+  <i>when</i> each structure is built, <i>which artifact</i> it lands in, and <i>how a query uses it</i>
+  afterwards. Every step below is one of the structures described above; here they run in sequence.
+</p>
+
+<h3>The example: two Maven modules, one calls the other</h3>
+<pre><code>shop/
+├─ pom.xml                      &lt;modules&gt; orders, payments
+├─ orders/
+│  ├─ pom.xml                   &lt;dependency&gt; com.shop:payments
+│  └─ src/main/java/com/shop/orders/OrderService.java
+└─ payments/
+   └─ src/main/java/com/shop/payments/PaymentGateway.java</code></pre>
+
+<pre><code>// orders/src/main/java/com/shop/orders/OrderService.java
+package com.shop.orders;
+import com.shop.payments.PaymentGateway;            // cross-module IMPORT
+
+public class OrderService {
+  private final PaymentGateway gateway;
+  public OrderService(PaymentGateway gateway) { this.gateway = gateway; }
+
+  public Receipt placeOrder(Cart cart) {
+    long total = cart.total();
+    return gateway.charge(cart.userId(), total);    // cross-module CALL
+  }
+}
+
+// payments/src/main/java/com/shop/payments/PaymentGateway.java
+package com.shop.payments;
+public class PaymentGateway {
+  public Receipt charge(String userId, long amount) {
+    return Receipt.of(userId, amount);
+  }
+}</code></pre>
+
+<p class="note">
+  Two facts in that code drive everything downstream: a <b>module dependency</b>
+  (orders&nbsp;→&nbsp;payments) and a <b>call edge</b> (placeOrder&nbsp;→&nbsp;charge). They are found by
+  <i>different</i> passes, at <i>different</i> times, and land in <i>different</i> artifacts — a file/module
+  edge in <code>dependency-graph.json</code>, a symbol edge in <code>call-graph.db</code> and
+  <code>llm-context.json</code>.
+</p>
+
+<h3>The whole run at a glance</h3>
+<div class="mermaid">
+flowchart TD
+  RUN["openlore analyze"] --> A["A · mapping<br/>walk · shards"]
+  A --> B["B · dependency-graph"]
+  B --> C["C · extractors<br/>inventories"]
+  C --> D["D · parse each file<br/>→ tree-sitter AST"]
+  D --> E["E · extract<br/>FunctionNode + CallEdge"]
+  E --> F["F · graph passes<br/>CSR · SCC · communities · rank"]
+  F --> G["G · hashes + indexes<br/>content hash · BM25 · vector"]
+  G --> H["H · write .openlore/analysis/"]
+  H --> I["I · publish generation.json"]
+  I --> J["J · served at query time"]
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>A · Mapping — walk the tree, cut it into module shards</h4>
+<p>
+  The first stage (<span class="ref">analysis-core.ts:187</span>) enumerates files and detects the
+  workspace's module boundaries by reading the build manifests.
+</p>
+<div class="mermaid">
+flowchart LR
+  ROOT["shop/ (repo root)"] --> FW["file-walker.ts<br/>bounded scan · .gitignore-aware"]
+  FW --> SH["workspace-shards.ts<br/>detectWorkspaceShards reads pom.xml"]
+  SH --> S1["shard: orders<br/>1 file"]
+  SH --> S2["shard: payments<br/>1 file"]
+  FW --> RM["repository-mapper.ts<br/>language: Java"]
+  RM --> RS["RepoStructure (in memory)<br/>2 files · 1 language"]
+</div>
+<p class="small">
+  Output so far: an in-memory <b>RepoStructure</b> and a <b>workspace-shards</b> report. Nothing is on disk yet.
+  <span class="ref">workspace-shards.json</span> is written at the end of the run.
+</p>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>B · Dependency graph — the cross-module edge</h4>
+<p>
+  The <code>DependencyGraphBuilder</code> (<span class="ref">analysis-core.ts:283</span>) parses every import
+  statement and every module manifest. Here it produces one edge: <code>OrderService.java → PaymentGateway.java</code>.
+</p>
+<div class="mermaid">
+flowchart TD
+  IMP["import-parser.ts<br/>parses 'import com.shop.payments.PaymentGateway'"] --> DG
+  MAN["workspace manifest<br/>pom.xml: orders depends on payments"] --> DG
+  DG["dependency-graph.ts<br/>DependencyEdge[]"] --> E1["edge: orders/OrderService.java<br/>→ payments/PaymentGateway.java"]
+  DG --> ART[("dependency-graph.json")]
+</div>
+<p class="small">
+  This is a coarse, <b>file-level</b> graph. It knows orders depends on payments; it does <i>not</i> yet
+  know that <code>placeOrder</code> calls <code>charge</code>. That is the next stage.
+</p>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>C · Extractors — the enrichment inventories</h4>
+<p>
+  Before the call graph, five bounded source scans run (<span class="ref">analysis-core.ts:359</span>):
+  UI components, schemas, routes, middleware, and env vars. A pure-Java subsystem contributes
+  <b>nothing</b> here — the inventories come out empty, which is a correct, honest result (and precisely
+  why they are <i>fail-soft</i> side artifacts, not required ones).
+</p>
+<div class="mermaid">
+flowchart LR
+  FILES["the two .java files"] --> SCAN["bounded-file-scan.ts<br/>4 MB cap · 8-way concurrency"]
+  SCAN --> INV["ui · schema · route · middleware · env<br/>→ 0 findings for pure Java"]
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>D · Parse — bytes become a tree-sitter AST</h4>
+<p>
+  Each file is parsed once with the Java grammar (<span class="ref">ast-chunker.ts:98</span> loads
+  <code>tree-sitter-java</code>; the parse is time-bounded by <span class="ref">parse-budget.ts</span>).
+  The AST is the only place raw bytes are read; everything after is derived from it.
+</p>
+<div class="mermaid">
+flowchart TD
+  F["OrderService.java bytes"] --> P["tree-sitter · Java grammar"]
+  P --> C["class_declaration · OrderService"]
+  C --> M1["method_declaration · placeOrder"]
+  C --> M2["constructor_declaration · OrderService"]
+  C --> FI["field_declaration · gateway : PaymentGateway"]
+  P --> CALL["method_invocation · gateway.charge(...)"]
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>E · Extract — FunctionNodes, then resolve the call</h4>
+<p>
+  The signature extractor turns declarations into <code>FunctionNode</code>s; the call-graph builder finds
+  invocation sites and resolves each callee through the symbol table. Resolving <code>gateway.charge</code>
+  needs the <b>receiver's type</b> — <code>gateway</code> is a field of type <code>PaymentGateway</code> — so the
+  receiver registry feeds the trie.
+</p>
+<div class="mermaid">
+flowchart TD
+  AST["Java AST"] --> SIG["signature-extractor.ts"]
+  SIG --> FN1["FunctionNode<br/>id: .../OrderService.java::OrderService.placeOrder"]
+  SIG --> FN2["FunctionNode<br/>id: .../OrderService.java::OrderService.&lt;init&gt;"]
+  AST --> CE["call-graph.ts<br/>call site: gateway.charge(...)"]
+  CE --> REG["receiver-registry.ts + type inference<br/>gateway : PaymentGateway"]
+  REG --> TRIE["function-registry-trie.ts<br/>resolve → PaymentGateway.charge"]
+  TRIE --> EDGE["CallEdge<br/>placeOrder → charge<br/>synthesized: false"]
+</div>
+<p class="small">
+  <code>PaymentGateway.charge</code> lives in the <i>other</i> module — but because both files are in the same
+  corpus, the trie resolves the edge directly. (Unresolved cross-language calls become HTTP edges instead; here
+  it is a real, non-synthesised call.)
+</p>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>F · Graph passes — CSR, SCC, communities, ranking</h4>
+<p>
+  With nodes and edges in hand, the fixed-point passes run over the whole graph
+  (<span class="ref">analysis-core.ts:406</span> → <span class="ref">artifact-generator.ts:467</span>).
+</p>
+<div class="mermaid">
+flowchart TD
+  NODES["FunctionNode[] + CallEdge[]"] --> ID["intern → dense ids"]
+  ID --> CSR["forward + backward CSR"]
+  CSR --> SCC["condensation.ts<br/>Tarjan SCC → component id"]
+  SCC --> COND["condensation DAG → topological position"]
+  COND --> COMM["cluster-graph.ts<br/>label propagation → communityId"]
+  COMM --> RANK["PageRank (files) + Brandes betweenness<br/>+ cyclomatic complexity"]
+  RANK --> DB[("call-graph.db<br/>SQLite edge store")]
+  CSR --> TIDX[("traversal-index.json<br/>CSR + SCC + topo order")]
+</div>
+<p class="small">
+  Our tiny graph is acyclic → each function is its own SCC → the condensation is the graph itself. A real
+  monorepo gets the full collapse-the-cycles benefit here.
+</p>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>G · Hashes and search indexes</h4>
+<div class="mermaid">
+flowchart TD
+  FN["FunctionNodes<br/>placeOrder · charge"] --> H["symbol-content-hash.ts<br/>normalized AST hash (16-hex)"]
+  FN --> SK["code-shaper.ts<br/>skeleton (signatures, no bodies)"]
+  SK --> BM["bm25-tokenizer.ts v2 → postings"]
+  SK --> TXT["text-line index"]
+  FN --> VEC["embed(document) → LanceDB row"]
+  FN --> DUP["duplicate-detector.ts<br/>shingles + Jaccard"]
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>H · Persist — write <code>.openlore/analysis/</code></h4>
+<p>
+  <code>generateAndSave</code> (<span class="ref">artifact-generator.ts:523</span>) flushes every artifact, then
+  <code>analysis-core.ts</code> adds the fingerprint, provenance, dependency graph, and generation manifest
+  under an analysis lock (<span class="ref">analysis-core.ts:413</span>).
+</p>
+<pre><code>.openlore/analysis/
+├─ repo-structure.json          structure, languages, domains        [required]
+├─ llm-context.json             signatures + call graph              [required]
+├─ dependency-graph.json        orders → payments (file edge)        [required]
+├─ fingerprint.json             content hash of the corpus            [required]
+├─ generation.json              binds the four above by SHA-256 digest
+├─ call-graph.db                SQLite edge store (placeOrder→charge)
+├─ traversal-index.json         CSR + Tarjan SCC + topological order
+├─ refactor-priorities.json     god functions / cycles / SRP
+├─ index-attestation.json       build-time integrity stamp
+├─ style-fingerprint.json       per-file style profile
+├─ parse-health.json            per-file parse status (fail-soft)
+├─ summary.md                   human-readable summary
+├─ dependencies.mermaid         visual dependency diagram
+├─ workspace-shards.json        module shard receipt
+└─ vector-index/                BM25 (default) + LanceDB vectors</code></pre>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>I · Publish — one atomically-bound generation</h4>
+<p>
+  Individual files are not a consistent set on their own. The run re-computes the project fingerprint and
+  <b>refuses to publish</b> if the source changed underneath it, then writes <code>generation.json</code> last —
+  binding every <b>required</b> artifact to one identity and digest
+  (<span class="ref">analysis-generation.ts:42</span>).
+</p>
+<div class="mermaid">
+flowchart LR
+  W["write required artifacts"] --> FP{"fingerprint<br/>unchanged?"}
+  FP -->|yes| PUB["publishGeneration()<br/>write generation.json last"]
+  FP -->|"no (source moved)"| ABORT["refuse · retry analyze"]
+  PUB --> CLEAN["clear any partial first-run index"]
+</div>
+<p class="small">
+  Side artifacts (style, parse-health, dynamic-boundary) are written but <b>not</b> required — so a missing
+  one can never block a publication or make the index look complete when it is not.
+</p>
+
+<!-- ─────────────────────────────────────────────────────────────────────── -->
+<h4>J · Serve — how a query uses the artifacts</h4>
+<p>
+  Nothing above happens at query time; queries only read the indexes. The payoff of the cross-module edge:
+</p>
+<div class="mermaid">
+flowchart TD
+  Q["search_code('charge')"] --> HIT["BM25 / vector hit"]
+  HIT --> S1["OrderService.placeOrder"]
+  HIT --> S2["PaymentGateway.charge"]
+  S1 --> EXP["call-graph expansion (BFS depth 2)"]
+  EXP --> S2
+  BR["blast_radius('PaymentGateway.charge')"] --> BC["backward CSR reach"]
+  BC --> S1
+  ST["select_tests"] --> BC
+  ORI["orient(task)"] --> PPR["personalized PageRank over seeds"]
+</div>
+<p class="small">
+  Search finds <i>both</i> functions; graph expansion links them; <code>blast_radius</code> walking the
+  <b>backward</b> CSR answers "what calls <code>charge</code>" and lands on <code>placeOrder</code> — the
+  cross-module caller — without re-parsing anything.
+</p>
+
+<h4>What the two files contributed, and where</h4>
 <table>
-  <tr><th>structure</th><th>build</th><th>query</th><th>notes</th></tr>
-  <tr><td>CSR adjacency (fwd+bwd)</td><td>O(V+E)</td><td>O(E) reach / O(1) neighbour slice</td><td>typed arrays; no per-query Map rebuild</td></tr>
-  <tr><td>Tarjan SCC (iterative)</td><td>O(V+E)</td><td>O(1) component lookup</td><td>explicit stack; no recursion overflow</td></tr>
-  <tr><td>Condensed reach</td><td>—</td><td>O(C + E_c) single sweep</td><td>C = components, collapses cycles</td></tr>
-  <tr><td>CFG + reaching defs</td><td>O(blocks × iterations)</td><td>O(1) def-use lookup</td><td>fixpoint; bounded iteration budget</td></tr>
-  <tr><td>PageRank</td><td>O(iters × E)</td><td>—</td><td>power iteration to tolerance</td></tr>
-  <tr><td>Personalized PageRank</td><td>O(iters × E_universe)</td><td>—</td><td>bounded to task neighbourhood</td></tr>
-  <tr><td>Label propagation</td><td>O(iters × E)</td><td>—</td><td>≤15 iters; sorted once</td></tr>
-  <tr><td>Brandes betweenness</td><td>O(V × E)</td><td>—</td><td>one BFS per source</td></tr>
-  <tr><td>BM25 inverted index</td><td>O(tokens)</td><td>O(query terms × postings)</td><td>persisted corpus sidecar</td></tr>
-  <tr><td>Vector index (ANN)</td><td>O(N × embed)</td><td>sub-linear NN</td><td>LanceDB, versioned</td></tr>
-  <tr><td>Content hash</td><td>O(tokens in symbol)</td><td>O(1) compare</td><td>normalized; comment/whitespace-blind</td></tr>
-  <tr><td>Shingles + Jaccard</td><td>O(tokens)</td><td>O(shingles)</td><td>lazy; bounded by gate</td></tr>
-  <tr><td>Line index</td><td>O(file length)</td><td>O(log lines)</td><td>binary search</td></tr>
+  <tr><th>source</th><th>what it produced</th><th>lands in</th></tr>
+  <tr><td><code>OrderService.java</code><br/>(module orders)</td><td>FunctionNode <code>placeOrder</code> + constructor; CallEdge <code>placeOrder→charge</code>; a community; PageRank/betweenness contribution; AST hash; BM25 tokens; one vector row</td><td><code>llm-context.json</code>, <code>call-graph.db</code>, <code>traversal-index.json</code>, <code>vector-index/</code></td></tr>
+  <tr><td><code>PaymentGateway.java</code><br/>(module payments)</td><td>FunctionNode <code>charge</code> (+1 fan-in as the callee); AST hash; BM25 tokens; one vector row</td><td>same artifacts</td></tr>
+  <tr><td><code>import com.shop.payments.*</code></td><td>a file-level DependencyEdge orders&nbsp;→&nbsp;payments</td><td><code>dependency-graph.json</code></td></tr>
+  <tr><td><code>pom.xml</code> modules</td><td>workspace shard boundaries (orders, payments)</td><td><code>workspace-shards.json</code></td></tr>
+  <tr><td>both files whole</td><td>one content fingerprint for the corpus</td><td><code>fingerprint.json</code></td></tr>
+  <tr><td>the run itself</td><td>digest binding of the required set</td><td><code>generation.json</code></td></tr>
 </table>
 
+<p class="ok">
+  <b>The through-line.</b> Bytes → one AST per file → FunctionNodes and edges → graph passes → hashes and
+  indexes → a digest-bound generation. The two modules never have to re-parse each other at query time: the
+  cross-module relationship is captured <i>once</i>, as edges, and every later question is a read over the
+  structures built here.
+</p>
+
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
-<h2 id="s11">11 · Deliberately NOT used</h2>
+<h2 id="s11">11 · Complexity &amp; memory table</h2>
+<p>
+  Cost model for every structure above, plus the <b>stated reason it was chosen</b> (what it buys over the
+  obvious alternative). Scroll sideways on narrow screens.
+</p>
+<div class="tablewrap">
+<table>
+  <tr><th>structure</th><th>build</th><th>query</th><th>memory</th><th>why this DS / algorithm</th><th>notes</th></tr>
+  <tr>
+    <td>CSR adjacency (fwd+bwd)</td><td>O(V+E)</td><td>O(E) reach / O(1) neighbour slice</td><td>O(V+E) — two Int32Arrays</td>
+    <td>Cache-friendly contiguous neighbour slices with zero per-query allocation — the one reason traversals stay fast at scale (beats a <code>Map&lt;node,Set&lt;node&gt;&gt;</code> that re-hashes on every step).</td>
+    <td>typed arrays; no per-query Map rebuild</td>
+  </tr>
+  <tr>
+    <td>Tarjan SCC (iterative)</td><td>O(V+E)</td><td>O(1) component lookup</td><td>O(V) — stack + index arrays</td>
+    <td>Collapses cyclic symbol groups into components so every later “can A reach B?” runs on a DAG and can never loop; iterative so deep graphs can’t overflow the call stack.</td>
+    <td>explicit stack; no recursion overflow</td>
+  </tr>
+  <tr>
+    <td>Condensed reach</td><td>—</td><td>O(C + E_c) single sweep</td><td>O(C) bits per reach set</td>
+    <td>One sweep over the super-graph answers reachability across whole components at once — replaces a per-pair search or an O(V²) transitive-closure matrix.</td>
+    <td>C = components, collapses cycles</td>
+  </tr>
+  <tr>
+    <td>CFG + reaching defs</td><td>O(blocks × iterations)</td><td>O(1) def-use lookup</td><td>O(blocks × vars) bitsets</td>
+    <td>Dataflow facts (which definition reaches which use) are exactly what impact/bug analysis needs; a monotone fixpoint is the standard, provably-correct way to derive them.</td>
+    <td>fixpoint; bounded iteration budget</td>
+  </tr>
+  <tr>
+    <td>PageRank</td><td>O(iters × E)</td><td>— (precomputed)</td><td>O(V) rank vector</td>
+    <td>Global, query-independent importance that is deterministic and explainable — no hand-tuned weights, honouring the “no hidden score” rule (beats a raw in-degree count).</td>
+    <td>power iteration to tolerance</td>
+  </tr>
+  <tr>
+    <td>Personalized PageRank</td><td>O(iters × E_universe)</td><td>— (per seed)</td><td>O(task neighbourhood)</td>
+    <td>Relevance is relative to a task seed; PPR gives a principled, bounded neighbourhood instead of an unbounded whole-graph walk.</td>
+    <td>bounded to task neighbourhood</td>
+  </tr>
+  <tr>
+    <td>Label propagation</td><td>O(iters × E)</td><td>— (precomputed)</td><td>O(V) labels</td>
+    <td>Near-linear community detection that discovers the number of groups itself — no need to fix K upfront, unlike k-means over embeddings.</td>
+    <td>≤15 iters; sorted once</td>
+  </tr>
+  <tr>
+    <td>Brandes betweenness</td><td>O(V × E)</td><td>— (precomputed)</td><td>O(V+E) per source</td>
+    <td>Exact chokepoint/bridge detection in the call graph — the gold-standard centrality; affordable because the graph is small enough to skip sampling.</td>
+    <td>one BFS per source</td>
+  </tr>
+  <tr>
+    <td>BM25 inverted index</td><td>O(tokens)</td><td>O(query terms × postings)</td><td>O(tokens) postings + vocab</td>
+    <td>Exact lexical recall with term-frequency saturation — deterministic and explainable, and it <i>complements</i> (never duplicates) the fuzzy ANN search.</td>
+    <td>persisted corpus sidecar</td>
+  </tr>
+  <tr>
+    <td>Vector index (ANN)</td><td>O(N × embed)</td><td>sub-linear NN</td><td>O(N × d) embeddings</td>
+    <td>Semantic recall for “find similar code” where the query shares no keywords — the one thing a lexical index structurally cannot do (beats brute-force cosine at O(N)/query).</td>
+    <td>LanceDB, versioned</td>
+  </tr>
+  <tr>
+    <td>Content hash</td><td>O(tokens in symbol)</td><td>O(1) compare</td><td>O(symbols) digests</td>
+    <td>Symbol-level change detection that is comment/whitespace-blind, so reformatting never churns the index (beats hashing raw file bytes).</td>
+    <td>normalized; comment/whitespace-blind</td>
+  </tr>
+  <tr>
+    <td>Shingles + Jaccard</td><td>O(tokens)</td><td>O(shingles)</td><td>O(shingles) transient</td>
+    <td>Set-similarity clone detection that survives edits and reordering — the cheapest robust near-duplicate measure (beats exact equality, which misses any drift).</td>
+    <td>lazy; bounded by gate</td>
+  </tr>
+  <tr>
+    <td>Line index</td><td>O(file length)</td><td>O(log lines)</td><td>O(lines) offsets</td>
+    <td>Maps byte offsets to line/column for diagnostics in O(log n) — no re-parsing the file per query.</td>
+    <td>binary search</td>
+  </tr>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="s12">12 · Deliberately NOT used</h2>
 <table>
   <tr><th>structure</th><th>status</th><th>why not</th></tr>
   <tr><td>Merkle trees</td><td><span class="tag declined">declined</span></td><td>Local index on the same disk — the file watcher + git already give the change signal. Merkle earns its keep only across a network/trust boundary (Cursor's remote index). A Merkle layer is "an optimization of theirs, not a new capability" (FIELD-RESEARCH-2026-07.md:62).</td></tr>
@@ -1076,13 +1413,13 @@ flowchart LR
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
-<h2 id="s12">12 · Future: how to integrate new structures</h2>
+<h2 id="s13">13 · Future: how to integrate new structures</h2>
 <p>
   Each entry gives <b>what it is</b>, <b>where it would plug in</b>, <b>the trigger to adopt</b>, and
   <b>the cost</b>. None is needed today; all are on the shelf.
 </p>
 
-<h3>12.1 · Merkle tree (for a remote / federated index)</h3>
+<h3>13.1 · Merkle tree (for a remote / federated index)</h3>
 <div class="mermaid">
 flowchart LR
   LOCAL["local repo"] --> MT["Merkle tree<br/>leaf=file hash → dir hash → root"]
@@ -1100,7 +1437,7 @@ flowchart LR
   <tr><th>reuse</th><td>the existing per-file content hash and graph digest are the natural leaf values</td></tr>
 </table>
 
-<h3>12.2 · Interval / 2-hop reachability labeling (GRAIL/FERRARI)</h3>
+<h3>13.2 · Interval / 2-hop reachability labeling (GRAIL/FERRARI)</h3>
 <div class="mermaid">
 flowchart LR
   G["condensation DAG"] --> LBL["label each node with intervals it can reach"]
@@ -1114,14 +1451,14 @@ flowchart LR
   <tr><th>cost</th><td>a precompute pass + an invalidation liability; equivalence tests would have to be extended</td></tr>
 </table>
 
-<h3>12.3 · Persistent / immutable graph versions (structural sharing)</h3>
+<h3>13.3 · Persistent / immutable graph versions (structural sharing)</h3>
 <table>
   <tr><th>what</th><td>hash-consed symbols + persistent maps so a re-analyze shares unchanged subtrees</td></tr>
   <tr><th>plug-in</th><td>the analyze/rebuild path in <code>artifact-generator.ts</code>, which already reaches for incremental reuse</td></tr>
   <tr><th>trigger</th><td>very large repos where a full re-analyze cost dominates</td></tr>
 </table>
 
-<h3>12.4 · Succinct bitmaps (Roaring / succinct) for reachable sets</h3>
+<h3>13.4 · Succinct bitmaps (Roaring / succinct) for reachable sets</h3>
 <p class="ref">candidate: condensation.ts reachBits / reachBitsCondensed</p>
 <div class="mermaid">
 flowchart LR
@@ -1136,7 +1473,7 @@ flowchart LR
   <tr><th>cost</th><td>bitmap library dependency; membership tests slower than a byte array — likely a loss for the current hot loop</td></tr>
 </table>
 
-<h3>12.5 · Count-Min sketch / HyperLogLog (frequency &amp; cardinality)</h3>
+<h3>13.5 · Count-Min sketch / HyperLogLog (frequency &amp; cardinality)</h3>
 <div class="mermaid">
 flowchart LR
   STREAM["edge stream"] --> CMS["Count-Min sketch:<br/>approximate term/edge frequency"]
@@ -1151,7 +1488,7 @@ flowchart LR
   <tr><th>cost</th><td>approximate answers; must be disclosed (OpenLore's "no hidden score" rule)</td></tr>
 </table>
 
-<h3>12.6 · HNSW / IVF tuning for the vector index</h3>
+<h3>13.6 · HNSW / IVF tuning for the vector index</h3>
 <div class="mermaid">
 flowchart LR
   EMB["embeddings"] --> IDX{"ANN structure"}
@@ -1165,7 +1502,7 @@ flowchart LR
   <tr><th>cost</th><td>tuning constants; a build-time cost; must keep determinism of results</td></tr>
 </table>
 
-<h3>12.7 · Bloom filter for negative lookups</h3>
+<h3>13.7 · Bloom filter for negative lookups</h3>
 <div class="mermaid">
 flowchart LR
   Q["query term"] --> BF{"in corpus at all?"}
@@ -1179,7 +1516,7 @@ flowchart LR
   <tr><th>cost</th><td>false positives only; a small rebuild-on-mutation liability</td></tr>
 </table>
 
-<h3>12.8 · Union-find (disjoint set) for reconciliation</h3>
+<h3>13.8 · Union-find (disjoint set) for reconciliation</h3>
 <div class="mermaid">
 flowchart LR
   A["symbol A"] --> UF["union-find"]
@@ -1195,7 +1532,7 @@ flowchart LR
   <tr><th>note</th><td>today communities come from label propagation; union-find is only a candidate for <i>merging</i> decisions</td></tr>
 </table>
 
-<h3>12.9 · LSM-style compaction (already partially present)</h3>
+<h3>13.9 · LSM-style compaction (already partially present)</h3>
 <div class="mermaid">
 flowchart LR
   UPD["append-only updates"] --> SEG["segments / versions"]
@@ -1208,7 +1545,7 @@ flowchart LR
   <tr><th>trigger</th><td>the spill store also accumulates dead rows over long watch sessions</td></tr>
 </table>
 
-<h3>12.10 · Simhash for cross-index reuse (Cursor-style)</h3>
+<h3>13.10 · Simhash for cross-index reuse (Cursor-style)</h3>
 <div class="mermaid">
 flowchart LR
   TREE["codebase hashes"] --> SIM["simhash → one summary value"]
@@ -1222,7 +1559,7 @@ flowchart LR
   <tr><th>cost</th><td>needs a store of candidate indexes; a similarity threshold; leak-safety if shared across users</td></tr>
 </table>
 
-<h3>12.11 · Top-k heap for truncated rankings</h3>
+<h3>13.11 · Top-k heap for truncated rankings</h3>
 <div class="mermaid">
 flowchart LR
   CAND["all candidates"] --> FULL["today: full sort O(n log n)"]
@@ -1237,7 +1574,7 @@ flowchart LR
   <tr><th>note</th><td>must preserve the exact tiebreak order the full sort guarantees</td></tr>
 </table>
 
-<h3>12.12 · Decision matrix — when to reach for which</h3>
+<h3>13.12 · Decision matrix — when to reach for which</h3>
 <table>
   <tr><th>structure</th><th>adopt when…</th><th>blocked by…</th><th>effort</th></tr>
   <tr><td>Merkle tree</td><td>remote / federated index</td><td>local-only today</td><td>high</td></tr>

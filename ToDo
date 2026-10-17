@@ -1,1 +1,131 @@
-1) push artifact to remote and use markel tress to sync
+# OpenLore ToDo
+
+Source of inspiration: https://archiesengupta.com/blog/cursor-index-pipeline
+("Reverse-Engineering Cursor's Blazingly Fast Indexing Pipeline")
+Cross-checked against Cursor's own posts (cursor.com/blog/secure-codebase-indexing,
+pragmaticengineer.com/p/cursor).
+
+What Cursor does, distilled:
+  1. Merkle tree over the file tree (per-file SHA-256 leaves, folder hash = hash of
+     sorted child hashes) -> O(k log n) change detection, not O(n).
+  2. Handshake: client uploads root hash. Match = zero bytes moved. Mismatch = recurse
+     only into branches whose hashes differ.
+  3. Selective reindex: only changed files are re-chunked, re-embedded, re-upserted.
+     A periodic sync cron reconciles drift.
+  4. AST-based semantic chunking via tree-sitter (chunk at function/class boundaries,
+     not fixed token windows).
+  5. Embeddings cached by chunk content hash, so unchanged chunks cost nothing to
+     re-index.
+  6. Respect .gitignore / .cursorignore (never index secrets / .env).
+  7. Content proofs: leaf hashes let a client query a copied index immediately and
+     drop results for files it cannot prove it has; background sync reconciles.
+  8. simhash derived from the tree -> find an already-indexed similar tree and seed
+     from it (team / new-clone fast start).
+  9. Storage: Turbopuffer (S3 object storage) + SPFresh centroid ANN + hot/cold tiering.
+
+Where OpenLore already is:
+  - export bundle -> single .openlore/index-bundle.olbundle; import = validate-or-rebuild
+    (src/cli/export/bundle.ts, src/core/analyzer/index-bundle.ts, docs/shareable-bundle.md).
+    Full snapshot only; no delta, no remote, no server, offline + deterministic by design.
+  - source-state.ts records only {commit, treeState: clean|dirty|unknown} for the whole tree
+    -> NO per-file hashes yet.
+  - partial-index.ts serves a first-run partial index under .openlore/runtime/.
+  - federation/registry.ts already keeps an "index of indexes" (per-repo .openlore).
+  - watcher exists; semantic search (LanceDB vector-index) is opt-in and NOT bundled
+    (rebuilt empty on import; `openlore embed --local` re-embeds everything).
+
+Guiding constraint: OpenLore is deterministic + local-first + no-network by default.
+Everything below is OPT-IN, must stay offline-capable, and must never weaken the
+validate-or-rebuild trust model in docs/shareable-bundle.md. No LLM in the hot path.
+
+---
+
+## P0 - Merkle tree over the analysis corpus (foundation for everything else)
+Delivers the original "use merkle trees to sync" idea.
+- [ ] Add per-file content hash (SHA-256) to source-state.ts (extend the existing
+      {commit, treeState} observation; leaves = tracked analysis-corpus files).
+- [ ] Folder nodes = hash of SORTED child hashes (sort is mandatory - filesystem order
+      differs across OS; unsorted roots produce false-positive diffs). Root = tree hash.
+- [ ] Serialize the tree next to the index (e.g. .openlore/analysis/merkle.json or as a
+      field in the generation manifest) and bind it to the generation digest so it is
+      never read half-written (reuse publishGeneration/readCurrentGeneration).
+- [ ] Respect the analysis corpus + ignore rules exactly (same file set analyze indexes);
+      honor .gitignore and an OpenLore ignore file; never hash .env / secrets paths.
+- [ ] diffTrees(local, remote) -> {added, modified, deleted} with early return when
+      root hashes match (O(1)) and recursion only into diverging subtrees (O(k log n)).
+- [ ] Tests: identical roots across OSes; targeted rebuild only touches changed files;
+      added/deleted detection; ignore-rule changes force full re-hash.
+
+## P0 - Root-hash handshake for sync
+- [ ] Give the bundle/import path a cheap "do we need anything?" precondition: compare
+      local Merkle root vs the artifact's recorded root before materializing.
+- [ ] Match -> no-op (currently import always materializes). Mismatch -> compute the diff
+      and only fetch/apply the diverging pieces.
+- [ ] Keep the existing validate-or-rebuild ladder as the fallback; the handshake is an
+      optimization that can never make a bad bundle look good.
+
+## P1 - Differential (delta) bundle instead of full-snapshot export
+- [ ] Extend the bundle envelope (BUNDLE_VERSION bump) to optionally carry a DELTA:
+      base tree root + changed-file graph slices, instead of the whole graph.
+- [ ] export --since <root|commit>: emit only the Merkle diff. Range/ancestor bundles
+      chain like a stack of immutable layers (Cursor/Glean "stacked immutable DBs" idea)
+      so a consumer can converge from any ancestor root.
+- [ ] import: if the local root is an ancestor present in the delta chain, apply the
+      delta; else fall back to full bundle / rebuild.
+- [ ] Determinism: delta export must still be byte-stable for a given (base, target) pair.
+- [ ] Keep regenerate-don't-merge discipline: a delta is generated, never hand-merged.
+
+## P1 - Remote artifact store (opt-in; the "push to remote" item)
+- [ ] Add a pluggable artifact backend: git ref, HTTP(S) GET/PUT, or object store
+      (S3/OCI/GCS) - `openlore push` / `openlore pull`. Offline/local stays the default.
+- [ ] Handshake-first: pull only exchanges Merkle roots + digests, then fetches patches.
+- [ ] Reuse the existing integrity attestation + optional Ed25519 signature so a remote
+      artifact is authenticated at least as strongly as a committed one.
+- [ ] Obfuscated paths (optional): if a remote is untrusted, allow uploading content
+      hashes + opaque ids only, never real paths/contents (Cursor's privacy model).
+- [ ] Never required: no hosted service, no registry dependency, no phone-home.
+
+## P1 - Incremental embeddings (chunk-content cache)
+- [ ] Chunk source with tree-sitter at semantic boundaries (function/class/method),
+      reusing the existing analyzer grammars (src/core/analyzer).
+- [ ] Key each embedding by the chunk's content hash; on re-index only embed changed
+      chunks. Persist the chunk->embedding cache (e.g. under .openlore/) so it survives
+      analyze runs (today semantic search is rebuilt from scratch).
+- [ ] Tie cache invalidation to the Merkle leaf change event (only that leaf re-embeds).
+- [ ] Consider bundling the embedding cache (or a delta of it) so import restores
+      semantic search instead of the current "re-embed everything with `openlore embed`".
+- [ ] Keep local-only embedding (no API key) as the default path.
+
+## P2 - simhash index reuse / team seeding (helps big monorepos + onboarding)
+- [ ] Derive a simhash from the Merkle tree (summary of content hashes).
+- [ ] On first analyze, look for an existing similar index (same team/fleet registry in
+      src/core/federation/registry.ts, or a remote store) within a threshold and seed
+      from it -> fast cold start on a new clone / new module.
+- [ ] Content proofs: while a seeded index is still being reconciled, serve only symbols
+      whose leaf hashes the local tree can prove, then drop proofs once roots converge.
+- [ ] This is the natural extension for the "huge monorepo / per-module index" case:
+      seed each module's index from the fleet, not from a full local build.
+
+## P2 - Periodic bounded sync (watcher + Merkle)
+- [ ] Reconcile on an interval (configurable; Cursor uses ~3-10 min) using the Merkle
+      diff, not a full scan. Reuse the existing watcher's converge-or-flag path.
+- [ ] Every reconcile must disclose any explicitly-stale remainder (never silently
+      divergent) - same contract as the current watcher.
+
+---
+
+## Out of scope / do NOT port
+- Turbopuffer / SPFresh / object-storage ANN tiers - OpenLore stays SQLite + LanceDB local;
+  storage-backend choice is not the win here (the win is the Merkle diff + delta + cache).
+- Storing code on a server / hosted index - contradicts local-first.
+- The "server stores embeddings, client holds source" split - OpenLore keeps both local.
+
+## Definition of done for the Merkle work
+- [ ] Second `openlore analyze` on an unchanged tree detects "nothing changed" via the root
+      hash and does ~zero work.
+- [ ] A one-file edit re-analyzes / re-embeds only the affected file(s) and their
+      dependents reachable by the graph.
+- [ ] `export`/`import` still pass the full validate-or-rebuild ladder and stay byte-deterministic.
+- [ ] No new runtime dependency, no network by default, no LLM in the hot path.
+- [ ] Docs: new docs/merkle-sync.md + update docs/shareable-bundle.md and
+      docs/ARCHITECTURE.md; add a spec change under openspec/.
